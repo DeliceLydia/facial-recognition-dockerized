@@ -1,0 +1,28 @@
+{
+  "name": "face-comparison-api",
+  "version": "2.0.0",
+  "description": "Fast face comparison API using face-api.js with tiny models",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "face-recognition",
+    "face-api",
+    "face-comparison"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "canvas": "^2.11.2",
+    "express": "^4.18.2",
+    "face-api.js": "^0.22.2",
+    "multer": "^2.0.2",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

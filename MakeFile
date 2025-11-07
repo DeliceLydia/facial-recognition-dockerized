@@ -1,0 +1,34 @@
+.PHONY: build up down restart logs clean test
+
+# Build the Docker image
+build:
+	docker compose build --no-cache
+
+# Start the service
+up:
+	docker compose up -d
+
+# Stop the service
+down:
+	docker compose down
+
+# Restart the service
+restart: down up
+
+# View logs
+logs:
+	docker compose logs -f
+
+# Clean everything
+clean:
+	docker compose down -v
+	docker system prune -af
+
+# Test the API
+test:
+	@echo "Testing health endpoint..."
+	@curl -s http://localhost:3000/health | jq
+	@echo "\nAPI is ready for face comparison!"
+
+# Build and run
+run: build up logs
