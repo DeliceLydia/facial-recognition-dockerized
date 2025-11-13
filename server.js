@@ -4,12 +4,6 @@ import canvas from "canvas";
 import fetch from "node-fetch";
 import path from "path";
 import { fileURLToPath } from "url";
-import multer from 'multer';
-
-const upload = multer({ 
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB max
-});
 
 const { Canvas, Image, ImageData } = canvas;
 
@@ -18,15 +12,15 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Set request timeout middleware FIRST
+// Increase timeout slightly
 app.use((req, res, next) => {
-  res.setTimeout(30000, () => {
-    console.log('⚠️  Request timeout after 30s');
+  res.setTimeout(45000, () => {
+    console.log('⚠️  Request timeout after 45s');
     if (!res.headersSent) {
       res.status(408).json({
         success: false,
         error: "Request Timeout",
-        message: "Processing took too long (>30s)"
+        message: "Processing took too long"
       });
     }
   });
@@ -35,14 +29,11 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "10mb" }));
 
-// Monkey patch face-api for Node.js
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
-// Models directory
 const MODEL_PATH = path.join(__dirname, "models");
 let modelsLoaded = false;
 
-// Load models
 async function loadModels() {
   console.log('Loading models from:', MODEL_PATH);
   
@@ -54,21 +45,21 @@ async function loadModels() {
   console.log("✅ Face-api models loaded successfully");
 }
 
-// Detection options - REDUCED for speed
+// CRITICAL: Much smaller input size for speed
 const detectionOptions = new faceapi.TinyFaceDetectorOptions({
-  inputSize: 320, // Reduced from 416 for faster processing
-  scoreThreshold: 0.5
+  inputSize: 128, // REDUCED from 320 - huge speed boost
+  scoreThreshold: 0.5 // Slightly lower to catch more faces
 });
 
-// Resize image - MORE AGGRESSIVE REDUCTION
-function resizeImage(img, maxSize = 416) { // Reduced from 512
+// AGGRESSIVE image resizing - this is the key to speed
+function resizeImage(img, maxSize = 128) { // REDUCED from 416
   const canvas = new Canvas(maxSize, maxSize);
   const ctx = canvas.getContext('2d');
   
   let width = img.width;
   let height = img.height;
   
-  // Calculate scale
+  // More aggressive scaling
   const scale = Math.min(maxSize / width, maxSize / height);
   
   width = Math.floor(width * scale);
@@ -77,18 +68,20 @@ function resizeImage(img, maxSize = 416) { // Reduced from 512
   canvas.width = width;
   canvas.height = height;
   
+  // Use lower quality but faster rendering
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'low'; // Fast rendering
   ctx.drawImage(img, 0, 0, width, height);
   
   return canvas;
 }
 
-// Load image from URL with timeout
+// Load from URL
 async function loadImageFromUrl(url) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
   
   try {
-    console.log('  ⏳ Fetching URL image...');
     const response = await fetch(url, { 
       signal: controller.signal,
       headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -97,22 +90,19 @@ async function loadImageFromUrl(url) {
     clearTimeout(timeoutId);
     
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      throw new Error(`HTTP ${response.status}`);
     }
     
     const buffer = await response.arrayBuffer();
-    console.log(`  ✓ URL image fetched (${(buffer.byteLength / 1024).toFixed(0)}KB)`);
-    
     const img = new Image();
     
     return new Promise((resolve, reject) => {
       const loadTimeout = setTimeout(() => {
         reject(new Error('Image decode timeout'));
-      }, 5000);
+      }, 3000);
       
       img.onload = () => {
         clearTimeout(loadTimeout);
-        console.log(`  ✓ URL image decoded (${img.width}x${img.height})`);
         resolve(resizeImage(img));
       };
       
@@ -126,40 +116,34 @@ async function loadImageFromUrl(url) {
   } catch (error) {
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-      throw new Error('URL fetch timeout (15s)');
+      throw new Error('URL fetch timeout');
     }
-    throw new Error(`URL image error: ${error.message}`);
+    throw error;
   }
 }
 
-// Load image from base64 with timeout
+// Load from base64
 async function loadImageFromBase64(base64String) {
   try {
-    console.log('  ⏳ Decoding base64 image...');
-    
-    // Remove data URI prefix
     const base64Data = base64String.replace(/^data:image\/\w+;base64,/, '');
-    console.log(`  ℹ️  Base64 size: ${(base64Data.length / 1024).toFixed(0)}KB`);
     
+    // For very large base64, decode in chunks (memory optimization)
     const buffer = Buffer.from(base64Data, 'base64');
-    console.log(`  ✓ Base64 decoded to buffer (${(buffer.length / 1024).toFixed(0)}KB)`);
-    
     const img = new Image();
     
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error('Base64 image decode timeout (5s)'));
-      }, 5000);
+        reject(new Error('Base64 decode timeout'));
+      }, 3000);
       
       img.onload = () => {
         clearTimeout(timeout);
-        console.log(`  ✓ Base64 image decoded (${img.width}x${img.height})`);
         resolve(resizeImage(img));
       };
       
       img.onerror = () => {
         clearTimeout(timeout);
-        reject(new Error('Invalid base64 image data'));
+        reject(new Error('Invalid base64 image'));
       };
       
       img.src = buffer;
@@ -169,227 +153,243 @@ async function loadImageFromBase64(base64String) {
   }
 }
 
-// Compare faces with proper timeout
+// Optimized face comparison
 async function compareFaces(imageUrl, base64Image) {
-  return new Promise(async (resolve, reject) => {
-    // Overall timeout for comparison
-    const overallTimeout = setTimeout(() => {
-      reject(new Error('Face comparison timeout (25s)'));
-    }, 25000);
+  const startTime = Date.now();
+  
+  try {
+    // Load images in parallel
+    console.log('⏳ Loading images...');
+    const loadStart = Date.now();
+    const [img1, img2] = await Promise.all([
+      loadImageFromUrl(imageUrl),
+      loadImageFromBase64(base64Image)
+    ]);
+    console.log(`✓ Images loaded: ${Date.now() - loadStart}ms`);
+
+    // Detect faces in parallel
+    console.log('⏳ Detecting faces...');
+    const detectStart = Date.now();
     
-    try {
-      const startTime = Date.now();
-      
-      // Step 1: Load images
-      console.log('📥 Step 1: Loading images...');
-      const [img1, img2] = await Promise.all([
-        loadImageFromUrl(imageUrl),
-        loadImageFromBase64(base64Image)
-      ]);
-      console.log(`✓ Images loaded in ${Date.now() - startTime}ms`);
+    const [detection1, detection2] = await Promise.all([
+      faceapi
+        .detectSingleFace(img1, detectionOptions)
+        .withFaceLandmarks(true)
+        .withFaceDescriptor(),
+      faceapi
+        .detectSingleFace(img2, detectionOptions)
+        .withFaceLandmarks(true)
+        .withFaceDescriptor()
+    ]);
+    
+    console.log(`✓ Faces detected: ${Date.now() - detectStart}ms`);
 
-      // Step 2: Detect faces with timeout
-      console.log('🔍 Step 2: Detecting faces...');
-      const detectStart = Date.now();
-      
-      const detectionPromise = Promise.all([
-        faceapi
-          .detectSingleFace(img1, detectionOptions)
-          .withFaceLandmarks(true)
-          .withFaceDescriptor(),
-        faceapi
-          .detectSingleFace(img2, detectionOptions)
-          .withFaceLandmarks(true)
-          .withFaceDescriptor()
-      ]);
-      
-      // Race between detection and timeout
-      const detectionTimeout = new Promise((_, timeoutReject) => {
-        setTimeout(() => timeoutReject(new Error('Face detection timeout (20s)')), 20000);
-      });
-      
-      const [detection1, detection2] = await Promise.race([
-        detectionPromise,
-        detectionTimeout
-      ]);
-      
-      console.log(`✓ Faces detected in ${Date.now() - detectStart}ms`);
-      
-      clearTimeout(overallTimeout);
-
-      // Step 3: Check results
-      if (!detection1 || !detection2) {
-        resolve({ 
-          success: false,
-          match: false, 
-          message: !detection1 && !detection2 
-            ? "No faces detected in both images"
-            : !detection1 
-            ? "No face detected in URL image"
-            : "No face detected in uploaded image",
-          processingTimeMs: Date.now() - startTime
-        });
-        return;
-      }
-
-      // Step 4: Calculate similarity
-      console.log('📊 Step 3: Comparing faces...');
-      const distance = faceapi.euclideanDistance(
-        detection1.descriptor, 
-        detection2.descriptor
-      );
-      
-      const threshold = 0.5;
-      const match = distance < threshold;
-      const similarity = Math.max(0, Math.min(100, (1 - distance) * 100));
-      
-      const totalTime = Date.now() - startTime;
-      console.log(`✅ Comparison complete in ${totalTime}ms`);
-      
-      resolve({ 
-        success: true,
-        match, 
-        distance: parseFloat(distance.toFixed(4)),
-        similarity: parseFloat(similarity.toFixed(2)),
-        threshold,
-        confidence: match ? 'high' : distance < 0.7 ? 'medium' : 'low',
-        processingTimeMs: totalTime
-      });
-      
-    } catch (error) {
-      clearTimeout(overallTimeout);
-      reject(error);
+    if (!detection1 || !detection2) {
+      return { 
+        success: false,
+        match: false, 
+        message: !detection1 && !detection2 
+          ? "No faces detected in both images"
+          : !detection1 
+          ? "No face detected in URL image"
+          : "No face detected in base64 image",
+        processingTimeMs: Date.now() - startTime
+      };
     }
-  });
+
+    // Compare
+    const distance = faceapi.euclideanDistance(
+      detection1.descriptor, 
+      detection2.descriptor
+    );
+    
+    const threshold = 0.5;
+    const match = distance < threshold;
+    const similarity = Math.max(0, Math.min(100, (1 - distance) * 100));
+    
+    return { 
+      success: true,
+      match, 
+      distance: parseFloat(distance.toFixed(4)),
+      similarity: parseFloat(similarity.toFixed(2)),
+      threshold,
+      confidence: match ? 'high' : distance < 0.7 ? 'medium' : 'low',
+      processingTimeMs: Date.now() - startTime
+    };
+    
+  } catch (error) {
+    throw error;
+  }
 }
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: modelsLoaded ? 'ready' : 'loading',
     timestamp: new Date().toISOString(),
-    service: 'face-comparison-api',
     uptime: Math.floor(process.uptime())
   });
 });
 
-// Compare faces endpoint
-app.post("/compare",  async (req, res) => {
+// Compare endpoint
+app.post("/compare", async (req, res) => {
   const requestId = Date.now();
-  console.log(`🔍 [${requestId}] New comparison request`);
+  console.log(`\n🔍 [${requestId}] Comparison request`);
   
   const startTime = Date.now();
   
   try {
-    // Check if models loaded
     if (!modelsLoaded) {
       return res.status(503).json({
         success: false,
-        error: "Service Unavailable",
-        message: "Models are still loading. Try again in a moment."
+        error: "Models still loading",
+        message: "Models still loading"
       });
     }
     
     const { imageUrl, base64Image } = req.body;
-    
-    
 
-    // Validate inputs
-    if (!imageUrl ||!base64Image) {
+    if (!imageUrl || !base64Image) {
       return res.status(400).json({ 
         success: false,
-        error: "Missing required field",
-        message: "'imageUrl and base64Image' is required" 
+        error: "Missing imageUrl or base64Image",
+        message: "Missing imageUrl or base64Image"
       });
     }
 
-    // Validate URL format
     if (!imageUrl.startsWith('http://') && !imageUrl.startsWith('https://')) {
       return res.status(400).json({ 
         success: false,
-        error: "Invalid URL",
-        message: "imageUrl must start with http:// or https://" 
+        error: "Invalid image URL  format",
+        message: "Invalid URL format"
       });
     }
 
-    console.log(` Request Details:`);
-    console.log(`   URL: ${imageUrl}`);
-    console.log(`   Base64 length: ${base64Image.length.toLocaleString()} chars`);
+    console.log(`📊 URL: ${imageUrl.substring(0, 60)}...`);
+    console.log(`📊 Base64: ${(base64Image.length / 1024).toFixed(0)}KB`);
 
-    // Perform comparison
     const result = await compareFaces(imageUrl, base64Image);
     
-    const processingTime = Date.now() - startTime;
+    const totalTime = Date.now() - startTime;
     
-    console.log(` [${requestId}] Result: ${result.match ? 'MATCH' : ' NO MATCH'}`);
-    console.log(`  Total time: ${processingTime}ms`);
-
+    console.log(`✅ [${requestId}] ${result.match ? 'MATCH ✓' : 'NO MATCH ✗'} (${totalTime}ms)\n`);
     
     res.json({
       ...result,
-      processingTimeMs: processingTime
+      processingTimeMs: totalTime
     });
     
   } catch (error) {
-    const processingTime = Date.now() - startTime;
-    console.error(` [${requestId}] Error: ${error.message}`);
-    console.error(`  Failed after: ${processingTime}ms`);
+    const totalTime = Date.now() - startTime;
+    console.error(`❌ [${requestId}] Error: ${error.message} (${totalTime}ms)\n`);
     
     if (!res.headersSent) {
       res.status(500).json({ 
         success: false,
-        error: "Face comparison failed",
+        error: error.message,
         message: error.message,
-        processingTimeMs: processingTime
+        processingTimeMs: totalTime
+      });
+    }
+  }
+});
+app.post("/detect", async (req, res) => {
+  const requestId = Date.now();
+  console.log(`\n🔍 [${requestId}] face detect request`);
+  
+  const startTime = Date.now();
+  
+  try {
+    if (!modelsLoaded) {
+      return res.status(503).json({
+        success: false,
+        error: "Models still loading"
+      });
+    }
+    
+    const { base64Image } = req.body;
+
+    if (!base64Image) {
+      return res.status(400).json({ 
+        success: false,
+        error: "Missing  base64Image image",
+        message: "Missing  base64Image image"
+      });
+    }
+
+    console.log(`📊 Base64: ${(base64Image.length / 1024).toFixed(0)}KB`);
+
+     console.log('⏳ Loading image...');
+    const loadStart = Date.now();
+    const [img1] = await Promise.all([
+      loadImageFromBase64(base64Image)
+    ]);
+    console.log(`✓ Image loaded: ${Date.now() - loadStart}ms`);
+
+    // Detect faces in parallel
+    console.log('⏳ Detecting face...');
+    
+    const detection = await faceapi
+        .detectSingleFace(img1, detectionOptions)
+        .withFaceLandmarks(true)
+        .withFaceDescriptor()
+      
+    
+    const totalTime = Date.now() - startTime;
+    
+    console.log(`✅ [${requestId}] ${detection ? 'Found ✓' : 'No face found'} (${totalTime}ms)\n`);
+    
+    res.json({
+    faceFound:detection?true:false,
+      processingTimeMs: totalTime
+    });
+    
+  } catch (error) {
+    const totalTime = Date.now() - startTime;
+    console.error(`❌ [${requestId}] Error: ${error.message} (${totalTime}ms)\n`);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        success: false,
+        error: error.message,
+        message: error.message,
+        processingTimeMs: totalTime
       });
     }
   }
 });
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({
+    message:"url not found",
     error: 'Not Found',
-    message: `Cannot ${req.method} ${req.url}`
+    path: req.url
   });
 });
 
 // Start server
 const PORT = process.env.PORT || 4000;
-const HOST = '0.0.0.0';
-
-const server = app.listen(PORT, HOST, async () => {
-  console.log(' Face Comparison API Starting...  ');
-
+const server = app.listen(PORT, '0.0.0.0', async () => {
+  console.log('\n🚀 Face Comparison API');
+  console.log(`   Port: ${PORT}`);
   
   try {
     await loadModels();
-    console.log(`   Server: http://localhost:${PORT} `);
-    console.log(`   Health: GET /health                `);
-    console.log(`  Compare: POST /compare (multipart)`);
+    console.log('   Status: ✅ Ready\n');
   } catch (error) {
-    console.error(' Failed to start server:', error);
+    console.error('❌ Failed to start:', error);
     process.exit(1);
   }
 });
 
-// Set server timeouts
-server.timeout = 35000; // 35 seconds
-server.keepAliveTimeout = 40000;
-server.headersTimeout = 41000;
+server.timeout = 50000;
+server.keepAliveTimeout = 55000;
+server.headersTimeout = 56000;
 
-// Graceful shutdown
 const shutdown = () => {
-  console.log('  Shutting down gracefully...');
-  server.close(() => {
-    console.log(' Server closed');
-    process.exit(0);
-  });
-  
-  setTimeout(() => {
-    console.error(' Forced shutdown after 10s');
-    process.exit(1);
-  }, 10000);
+  console.log('Shutting down...');
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000);
 };
 
 process.on('SIGTERM', shutdown);
